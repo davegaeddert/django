@@ -70,3 +70,19 @@ class CompositePKOrderByTests(TestCase):
             Comment.objects.order_by("-pk"),
             Comment.objects.order_by(F("pk").desc(nulls_last=True)),
         )
+
+    def test_order_by_position_of_column_after_composite_pk(self):
+        # A composite primary key is selected as one column per target, so
+        # ordering by position must account for its width.
+        user = User.objects.create(
+            tenant=self.tenant_2, id=4, email="user0000@example.com"
+        )
+        self.assertSequenceEqual(
+            User.objects.values_list("pk", "email").order_by("email"),
+            (
+                (user.pk, "user0000@example.com"),
+                (self.user_1.pk, "user0001@example.com"),
+                (self.user_2.pk, "user0002@example.com"),
+                (self.user_3.pk, "user0003@example.com"),
+            ),
+        )
