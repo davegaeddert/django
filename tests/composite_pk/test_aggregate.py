@@ -162,6 +162,14 @@ class CompositePKAggregateTests(TestCase):
         with self.assertRaisesMessage(TypeError, msg):
             Comment.objects.values("tenant").annotate(max=Max("id")).first()
 
+    def test_count_sliced_distinct_values_pk(self):
+        # Slicing a distinct queryset ordered by an unselected column wraps
+        # it in a subquery that reselects each selection by alias; a
+        # composite selection carries one alias per column.
+        self.assertEqual(
+            User.objects.values("pk").distinct().order_by("email")[:2].count(), 2
+        )
+
     @skipUnlessDBFeature("allows_group_by_select_index")
     def test_group_by_position_of_column_after_composite_pk(self):
         # A composite primary key is selected as one column per target, so

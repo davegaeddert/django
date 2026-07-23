@@ -1055,7 +1055,18 @@ class SQLCompiler:
                 sub_selects = []
                 sub_params = []
                 for index, (select, _, alias) in enumerate(self.select, start=1):
-                    if alias:
+                    if isinstance(alias, tuple):
+                        # A composite selection carries one alias per physical
+                        # column.
+                        sub_selects.extend(
+                            "%s.%s"
+                            % (
+                                self.connection.ops.quote_name("subquery"),
+                                self.connection.ops.quote_name(target_alias),
+                            )
+                            for target_alias in alias
+                        )
+                    elif alias:
                         sub_selects.append(
                             "%s.%s"
                             % (
