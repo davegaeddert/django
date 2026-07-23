@@ -340,10 +340,11 @@ class SQLCompiler:
         # reference downstream (ordering, grouping, DISTINCT ON). A composite
         # ColPairs selection compiles to as many output columns as it has
         # targets, so positions and select entries diverge past one.
-        # select_ordinals maps the deliberately aliased selections, recorded
-        # before any synthetic subquery alias (col1, col2, ...) is assigned
-        # so those cannot shadow a field name. select_positions carries
-        # (ordinal, width) per select entry, in order.
+        # select_ordinals maps each deliberately aliased selection to its
+        # (ordinal, width), recorded before any synthetic subquery alias
+        # (col1, col2, ...) is assigned so those cannot shadow a field name.
+        # select_positions carries (ordinal, width) per select entry, in
+        # order.
         select_ordinals = {}
         select_positions = []
         ordinal = 1
@@ -365,7 +366,7 @@ class SQLCompiler:
                 sql, params = col.select_format(self, sql, params)
             width = len(col) if isinstance(col, ColPairs) else 1
             if alias is not None:
-                select_ordinals.setdefault(alias, ordinal)
+                select_ordinals.setdefault(alias, (ordinal, width))
             select_positions.append((ordinal, width))
             ordinal += width
             if alias is None and with_col_aliases:
@@ -1180,7 +1181,8 @@ class SQLCompiler:
             selectable = {*self.query.values_select, *self.query.annotation_select}
         for name in self.query.distinct_fields:
             if name in selectable and (position := self.select_ordinals.get(name)):
-                result.append(str(position))
+                first, width = position
+                result.extend(str(first + i) for i in range(width))
                 continue
             parts = name.split(LOOKUP_SEP)
             _, targets, alias, joins, path, _, transform_function = self._setup_joins(

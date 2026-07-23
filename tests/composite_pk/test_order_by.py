@@ -102,6 +102,14 @@ class CompositePKOrderByTests(TestCase):
             ),
         )
 
+    @skipUnlessDBFeature("can_distinct_on_fields")
+    def test_distinct_on_composite_annotation(self):
+        # An aliased composite selection spans several physical columns, and
+        # DISTINCT ON must cover all of them — users sharing a tenant must
+        # not be collapsed.
+        qs = User.objects.annotate(cp=F("pk")).distinct("cp").order_by("cp")
+        self.assertSequenceEqual(qs, (self.user_1, self.user_2, self.user_3))
+
     def test_union_order_by_composite_pk(self):
         # A composite selection spans several aliased columns in the combined
         # queries, and ordering by it must order by each of them.
