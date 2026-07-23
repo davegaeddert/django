@@ -166,9 +166,11 @@ class SQLCompiler:
         for idx, (expr, _, alias) in enumerate(select):
             if alias:
                 # Positions are the physical output columns recorded by
-                # get_select(). Entries past its select clause are the
-                # ordering-forced extra selections, which are never aliased.
-                selected_expr_positions[expr] = self.select_positions[idx][0]
+                # get_select(), kept with their widths so a composite
+                # selection contributes every position it occupies. Entries
+                # past its select clause are the ordering-forced extra
+                # selections, which are never aliased.
+                selected_expr_positions[expr] = self.select_positions[idx]
             # Skip members of the select clause that are already explicitly
             # grouped against.
             if alias in group_by_refs:
@@ -199,7 +201,9 @@ class SQLCompiler:
                 allows_group_by_select_index
                 and (position := selected_expr_positions.get(expr)) is not None
             ):
-                sql, params = str(position), ()
+                first, width = position
+                sql = ", ".join(str(first + i) for i in range(width))
+                params = ()
             else:
                 sql, params = expr.select_format(self, sql, params)
             params_hash = make_hashable(params)

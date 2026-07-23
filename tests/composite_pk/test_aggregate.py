@@ -162,6 +162,19 @@ class CompositePKAggregateTests(TestCase):
         with self.assertRaisesMessage(TypeError, msg):
             Comment.objects.values("tenant").annotate(max=Max("id")).first()
 
+    def test_count_grouped_values_pk(self):
+        # Counting over grouped values() wraps the grouped query in a
+        # subquery with column aliases; positional grouping must cover every
+        # physical column of the composite selection.
+        self.assertEqual(
+            User.objects.values("pk", "email").annotate(n=Count("comments")).count(),
+            3,
+        )
+        self.assertEqual(
+            User.objects.values("email", "pk").annotate(n=Count("comments")).count(),
+            3,
+        )
+
     def test_aggregate_sliced_values_pk_with_colliding_annotation_alias(self):
         # Synthetic subquery aliases (col1, col2, ...) for the composite
         # selection must not collide with an annotation deliberately named
