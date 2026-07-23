@@ -188,6 +188,12 @@ class DistinctOnTests(TestCase):
         )
         self.assertSequenceEqual(qs, [self.p1_o1, self.p2_o1, self.p3_o1])
 
+    def test_distinct_on_field_shadowed_by_extra_select(self):
+        # An extra() selection reusing a field name must not capture the
+        # field's DISTINCT ON reference.
+        qs = Staff.objects.extra(select={"name": "1"}).distinct("name")
+        self.assertEqual(qs.count(), 3)
+
     def test_distinct_on_field_named_like_synthetic_alias(self):
         # In a subquery, unaliased selections receive synthetic column
         # aliases (col1, col2, ...) that must not be mistaken for a field

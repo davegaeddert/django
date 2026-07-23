@@ -1061,9 +1061,14 @@ class SQLCompiler:
         # refer to different positions of equal expressions. Positions come
         # from get_select() and count physical output columns; ordering
         # counts select entries instead, so the two disagree past a composite
-        # selection until ordering counts physical columns as well.
+        # selection until ordering counts physical columns as well. Extra
+        # selections are excluded — an extra() alias reusing a field name
+        # must not capture the field's DISTINCT ON reference.
+        selectable = ()
+        if self.query.distinct_fields:
+            selectable = {*self.query.values_select, *self.query.annotation_select}
         for name in self.query.distinct_fields:
-            if position := self.select_ordinals.get(name):
+            if name in selectable and (position := self.select_ordinals.get(name)):
                 result.append(str(position))
                 continue
             parts = name.split(LOOKUP_SEP)
