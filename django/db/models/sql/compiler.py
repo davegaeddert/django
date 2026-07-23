@@ -357,26 +357,38 @@ class SQLCompiler:
         # Avoid computing `selected_exprs` if there is no `ordering` as it's
         # relatively expensive.
         if ordering and (select := self.select):
-            distinct_fields = self.query.distinct_fields
             annotation_select = self.query.annotation_select
             # An expression can be selected at more than one position, e.g.
             # when two lookup paths resolve to the same column. get_distinct()
             # refers to such selections by expression and PostgreSQL binds an
             # expression reference to the first position it is selected at, so
             # ordering must refer to that position as well for the prefixes of
-            # both clauses to match. Raw selections are excluded as equal SQL
-            # is not necessarily interchangeable, e.g. a volatile function
-            # selected twice.
+            # both clauses to match. Only the DISTINCT ON expressions are
+            # remapped; other duplicated selections keep their own positions,
+            # e.g. a volatile expression selected twice must keep ordering by
+            # its own position.
+            distinct_exprs = set()
+            if opts := self.query.get_meta():
+                for name in self.query.distinct_fields:
+                    if name in annotation_select:
+                        # get_distinct() refers to annotations by alias, which
+                        # binds to their own position.
+                        continue
+                    parts = name.split(LOOKUP_SEP)
+                    _, targets, alias, joins, path, _, transform_function = (
+                        self._setup_joins(parts, opts, None)
+                    )
+                    targets, alias, _ = self.query.trim_joins(targets, joins, path)
+                    for target in targets:
+                        distinct_exprs.add(transform_function(target, alias))
             first_positions = {}
             for ordinal, (expr, _, alias) in enumerate(select, start=1):
                 pos_expr = PositionRef(ordinal, alias, expr)
-                if distinct_fields and not isinstance(expr, RawSQL):
+                if expr in distinct_exprs:
                     first_pos_expr = first_positions.setdefault(expr, pos_expr)
                 else:
                     first_pos_expr = pos_expr
                 if alias:
-                    # get_distinct() refers to annotations by alias, which
-                    # binds to their own position.
                     selected_exprs[alias] = (
                         pos_expr if alias in annotation_select else first_pos_expr
                     )

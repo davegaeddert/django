@@ -1,11 +1,19 @@
 from django.db import connection
-from django.db.models import CharField, F, FloatField, Max
+from django.db.models import CharField, F, FloatField, Max, Transform
 from django.db.models.expressions import RawSQL
 from django.db.models.functions import Lower
 from django.test import TestCase, skipUnlessDBFeature
 from django.test.utils import register_lookup
 
 from .models import Celebrity, Fan, Staff, StaffTag, Tag
+
+
+class Volatile(Transform):
+    """Equal instances produce independent values, like random()."""
+
+    lookup_name = "volatile"
+    output_field = FloatField()
+    template = "(RANDOM() + 0 * LENGTH(%(expressions)s))"
 
 
 @skipUnlessDBFeature("can_distinct_on_fields")
@@ -292,6 +300,22 @@ class DistinctOnTests(TestCase):
                 (None, None, None, "p3"),
             ],
         )
+
+    def test_distinct_on_duplicated_volatile_transform(self):
+        # A volatile transform selected through two lookup paths yields equal
+        # expressions that evaluate independently. Selections that are not
+        # DISTINCT ON expressions keep ordering by their own position.
+        fields = ["stafftag__tag__name__volatile", "tags__name__volatile", "name"]
+        with register_lookup(CharField, Volatile):
+            qs = (
+                Staff.objects.values_list(*fields)
+                .distinct("name")
+                .order_by("name", "tags__name__volatile")
+            )
+            # The second volatile selection is ordered by its own position,
+            # not remapped to the position of the first.
+            self.assertIn("2 ASC", str(qs.query))
+            self.assertEqual(len(qs), 3)
 
     def test_distinct_on_duplicated_raw_sql_annotations(self):
         # Identical raw SQL selections compare equal but are evaluated
