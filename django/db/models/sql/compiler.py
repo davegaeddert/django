@@ -3,7 +3,7 @@ import json
 import re
 import warnings
 from functools import partial
-from itertools import chain
+from itertools import chain, count, islice
 
 from django.core.exceptions import EmptyResultSet, FieldError, FullResultSet
 from django.db import DatabaseError, NotSupportedError
@@ -322,7 +322,15 @@ class SQLCompiler:
             self.get_select_from_parent(klass_info)
 
         ret = []
-        col_idx = 1
+        if with_col_aliases:
+            # Synthetic aliases must not collide with deliberate selection
+            # aliases — an annotation may itself be named col2.
+            taken_aliases = {a for _, a in select if a is not None}
+            synthetic_aliases = (
+                candidate
+                for index in count(1)
+                if (candidate := f"col{index}") not in taken_aliases
+            )
         # The physical output positions of the select clause, recorded once
         # here where the clause is built and consumed by every position
         # reference downstream (ordering, grouping, DISTINCT ON). A composite
@@ -362,7 +370,7 @@ class SQLCompiler:
                     # alias cannot address the whole span. The aliases are
                     # embedded in the SQL here; the tuple alias tells
                     # as_sql() not to append another.
-                    alias = tuple(f"col{col_idx + i}" for i in range(width))
+                    alias = tuple(islice(synthetic_aliases, width))
                     sql = ", ".join(
                         "%s AS %s"
                         % (
@@ -371,10 +379,8 @@ class SQLCompiler:
                         )
                         for target_col, target_alias in zip(col.get_cols(), alias)
                     )
-                    col_idx += width
                 else:
-                    alias = f"col{col_idx}"
-                    col_idx += 1
+                    alias = next(synthetic_aliases)
             ret.append((col, (sql, params), alias))
         self.select_ordinals = select_ordinals
         self.select_positions = select_positions
