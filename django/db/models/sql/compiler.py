@@ -157,9 +157,15 @@ class SQLCompiler:
         # set to group by. So, we need to add cols in select, order_by, and
         # having into the select in any case.
         selected_expr_positions = {}
-        for ordinal, (expr, _, alias) in enumerate(select, start=1):
+        ordinal = 1
+        for expr, _, alias in select:
             if alias:
                 selected_expr_positions[expr] = ordinal
+            # A ColPairs selection is compiled to as many columns as it has
+            # targets, e.g. when a composite primary key is selected, so the
+            # next selection is that many positions further down the select
+            # clause.
+            ordinal += len(expr) if isinstance(expr, ColPairs) else 1
             # Skip members of the select clause that are already explicitly
             # grouped against.
             if alias in group_by_refs:
@@ -357,11 +363,17 @@ class SQLCompiler:
         # Avoid computing `selected_exprs` if there is no `ordering` as it's
         # relatively expensive.
         if ordering and (select := self.select):
-            for ordinal, (expr, _, alias) in enumerate(select, start=1):
+            ordinal = 1
+            for expr, _, alias in select:
                 pos_expr = PositionRef(ordinal, alias, expr)
                 if alias:
                     selected_exprs[alias] = pos_expr
                 selected_exprs[expr] = pos_expr
+                # A ColPairs selection is compiled to as many columns as it
+                # has targets, e.g. when a composite primary key is selected,
+                # so the next selection is that many positions further down
+                # the select clause.
+                ordinal += len(expr) if isinstance(expr, ColPairs) else 1
 
         for field in ordering:
             if hasattr(field, "resolve_expression"):
