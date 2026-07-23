@@ -81,6 +81,10 @@ class SQLCompiler:
             with_col_aliases=with_col_aliases,
         )
         self.col_count = len(self.select)
+        # Rows are composed of physical columns, of which a select entry can
+        # span several (a composite ColPairs selection), so rows must not be
+        # sliced by the entry count.
+        self.row_col_count = sum(width for _, width in self.select_positions)
 
     def pre_sql_setup(self, with_col_aliases=False):
         """
@@ -353,8 +357,24 @@ class SQLCompiler:
             select_positions.append((ordinal, width))
             ordinal += width
             if alias is None and with_col_aliases:
-                alias = f"col{col_idx}"
-                col_idx += 1
+                if isinstance(col, ColPairs):
+                    # Each physical column carries its own alias, as one
+                    # alias cannot address the whole span. The aliases are
+                    # embedded in the SQL here; the tuple alias tells
+                    # as_sql() not to append another.
+                    alias = tuple(f"col{col_idx + i}" for i in range(width))
+                    sql = ", ".join(
+                        "%s AS %s"
+                        % (
+                            self.compile(target_col)[0],
+                            self.connection.ops.quote_name(target_alias),
+                        )
+                        for target_col, target_alias in zip(col.get_cols(), alias)
+                    )
+                    col_idx += width
+                else:
+                    alias = f"col{col_idx}"
+                    col_idx += 1
             ret.append((col, (sql, params), alias))
         self.select_ordinals = select_ordinals
         self.select_positions = select_positions
@@ -699,10 +719,22 @@ class SQLCompiler:
         # might have been masked via values() and alias(). If any masked
         # aliases are added they'll be masked again to avoid fetching
         # the data in the `if qual_aliases` branch below.
-        select = {
-            expr: alias for expr, _, alias in self.get_select(with_col_aliases=True)[0]
-        }
-        select_aliases = set(select.values())
+        # An expression can be selected at more than one position, e.g. when
+        # two lookup paths resolve to the same column, so the aliases of every
+        # selection must be tracked and not only one per expression, otherwise
+        # the masking of the outer query below drops the extra selections.
+        selected = self.get_select(with_col_aliases=True)[0]
+        select = {}
+        selected_aliases = []
+        for expr, _, alias in selected:
+            if isinstance(alias, tuple):
+                # A composite selection spans several physical columns, each
+                # with its own alias.
+                selected_aliases.extend(alias)
+            else:
+                select.setdefault(expr, alias)
+                selected_aliases.append(alias)
+        select_aliases = set(selected_aliases)
         qual_aliases = set()
         replacements = {}
 
@@ -760,7 +792,7 @@ class SQLCompiler:
         if qual_aliases:
             # If some select aliases were unmasked for filtering purposes they
             # must be masked back.
-            cols = [self.connection.ops.quote_name(alias) for alias in select.values()]
+            cols = [self.connection.ops.quote_name(alias) for alias in selected_aliases]
             result = [
                 "SELECT",
                 ", ".join(cols),
@@ -851,7 +883,9 @@ class SQLCompiler:
 
                 out_cols = []
                 for _, (s_sql, s_params), alias in self.select + extra_select:
-                    if alias:
+                    # A tuple alias spans several physical columns and is
+                    # already embedded in the SQL by get_select().
+                    if alias and not isinstance(alias, tuple):
                         s_sql = "%s AS %s" % (
                             s_sql,
                             self.connection.ops.quote_name(alias),
@@ -1684,7 +1718,7 @@ class SQLCompiler:
             try:
                 val = cursor.fetchone()
                 if val:
-                    return val[0 : self.col_count]
+                    return val[0 : self.row_col_count]
                 return val
             finally:
                 # done with the cursor
@@ -1696,7 +1730,7 @@ class SQLCompiler:
         result = cursor_iter(
             cursor,
             self.connection.features.empty_fetchmany_value,
-            self.col_count if self.has_extra_select else None,
+            self.row_col_count if self.has_extra_select else None,
             chunk_size,
         )
         if not chunked_fetch or not self.connection.features.can_use_chunked_reads:
@@ -2284,6 +2318,8 @@ class SQLAggregateCompiler(SQLCompiler):
             sql.append(ann_sql)
             params.extend(ann_params)
         self.col_count = len(self.query.annotation_select)
+        # Aggregations are always compiled to a single column each.
+        self.row_col_count = self.col_count
         sql = ", ".join(sql)
         params = tuple(params)
 

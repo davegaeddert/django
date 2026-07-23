@@ -1,9 +1,11 @@
 from collections import namedtuple
 from uuid import UUID
 
-from django.test import TestCase
+from django.db.models import F, Window
+from django.db.models.functions import RowNumber
+from django.test import TestCase, skipUnlessDBFeature
 
-from .models import Comment, Post, Tenant, User
+from .models import Comment, Post, Tenant, Token, User
 
 
 class CompositePKValuesTests(TestCase):
@@ -224,3 +226,43 @@ class CompositePKValuesTests(TestCase):
                     values[0]["user"], (self.user_1.tenant_id, self.user_1.id)
                 )
                 self.assertEqual(values[0]["integer"], 42)
+
+    def test_values_distinct_ordered_by_unselected_field(self):
+        # Ordering by an unselected field adds it to the select clause, and the
+        # extra column must be stripped from the rows without truncating the
+        # composite primary key, which is selected as several columns.
+        self.assertSequenceEqual(
+            User.objects.values("pk").distinct().order_by("email"),
+            (
+                {"pk": self.user_1.pk},
+                {"pk": self.user_2.pk},
+                {"pk": self.user_3.pk},
+            ),
+        )
+        self.assertSequenceEqual(
+            User.objects.values("pk", "id").distinct().order_by("email"),
+            (
+                {"pk": self.user_1.pk, "id": self.user_1.id},
+                {"pk": self.user_2.pk, "id": self.user_2.id},
+                {"pk": self.user_3.pk, "id": self.user_3.id},
+            ),
+        )
+
+    @skipUnlessDBFeature("supports_over_clause")
+    def test_values_pk_with_filtered_window(self):
+        # The filtered window wraps the query via get_qualify_sql(), which
+        # masks the inner query by its column aliases. Each physical column
+        # of the composite pk must carry its own alias for the mask to
+        # address them all.
+        token_1 = Token.objects.create(tenant=self.tenant_1, id=1)
+        token_2 = Token.objects.create(tenant=self.tenant_1, id=2)
+        token_3 = Token.objects.create(tenant=self.tenant_2, id=3)
+        del token_2
+        qs = (
+            Token.objects.annotate(
+                rn=Window(RowNumber(), partition_by=F("tenant_id"), order_by="id")
+            )
+            .filter(rn=1)
+            .values_list("pk", "secret")
+        )
+        self.assertCountEqual(qs, [(token_1.pk, ""), (token_3.pk, "")])
