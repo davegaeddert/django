@@ -62,6 +62,7 @@ class SQLCompiler:
         # columns are not included in self.select.
         self.select = None
         self.select_ordinals = None
+        self.select_positions = None
         self.annotation_col_map = None
         self.klass_info = None
         self._meta_ordering = None
@@ -158,9 +159,12 @@ class SQLCompiler:
         # set to group by. So, we need to add cols in select, order_by, and
         # having into the select in any case.
         selected_expr_positions = {}
-        for ordinal, (expr, _, alias) in enumerate(select, start=1):
+        for idx, (expr, _, alias) in enumerate(select):
             if alias:
-                selected_expr_positions[expr] = ordinal
+                # Positions are the physical output columns recorded by
+                # get_select(). Entries past its select clause are the
+                # ordering-forced extra selections, which are never aliased.
+                selected_expr_positions[expr] = self.select_positions[idx][0]
             # Skip members of the select clause that are already explicitly
             # grouped against.
             if alias in group_by_refs:
@@ -315,11 +319,17 @@ class SQLCompiler:
 
         ret = []
         col_idx = 1
-        # Physical output positions of the deliberately aliased selections,
-        # recorded before any synthetic subquery alias (col1, col2, ...) is
-        # assigned so those cannot shadow a field name. A composite ColPairs
-        # selection spans several output columns.
+        # The physical output positions of the select clause, recorded once
+        # here where the clause is built and consumed by every position
+        # reference downstream (ordering, grouping, DISTINCT ON). A composite
+        # ColPairs selection compiles to as many output columns as it has
+        # targets, so positions and select entries diverge past one.
+        # select_ordinals maps the deliberately aliased selections, recorded
+        # before any synthetic subquery alias (col1, col2, ...) is assigned
+        # so those cannot shadow a field name. select_positions carries
+        # (ordinal, width) per select entry, in order.
         select_ordinals = {}
+        select_positions = []
         ordinal = 1
         for col, alias in select:
             try:
@@ -337,14 +347,17 @@ class SQLCompiler:
                 sql, params = self.compile(Value(True))
             else:
                 sql, params = col.select_format(self, sql, params)
+            width = len(col) if isinstance(col, ColPairs) else 1
             if alias is not None:
                 select_ordinals.setdefault(alias, ordinal)
-            ordinal += len(col) if isinstance(col, ColPairs) else 1
+            select_positions.append((ordinal, width))
+            ordinal += width
             if alias is None and with_col_aliases:
                 alias = f"col{col_idx}"
                 col_idx += 1
             ret.append((col, (sql, params), alias))
         self.select_ordinals = select_ordinals
+        self.select_positions = select_positions
         return ret, klass_info, annotations
 
     def _order_by_pairs(self):
@@ -368,7 +381,11 @@ class SQLCompiler:
         # Avoid computing `selected_exprs` if there is no `ordering` as it's
         # relatively expensive.
         if ordering and (select := self.select):
-            for ordinal, (expr, _, alias) in enumerate(select, start=1):
+            # Positions are the physical output columns recorded by
+            # get_select(), so they stay aligned with DISTINCT ON references
+            # and with what the database counts, also past a composite
+            # selection that spans several columns.
+            for (expr, _, alias), (ordinal, _) in zip(select, self.select_positions):
                 pos_expr = PositionRef(ordinal, alias, expr)
                 if alias:
                     selected_exprs[alias] = pos_expr
