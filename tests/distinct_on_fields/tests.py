@@ -1,10 +1,19 @@
 from django.db import connection
-from django.db.models import CharField, F, Max
+from django.db.models import CharField, F, FloatField, Max, Transform
+from django.db.models.expressions import RawSQL
 from django.db.models.functions import Lower
 from django.test import TestCase, skipUnlessDBFeature
 from django.test.utils import register_lookup
 
-from .models import Celebrity, Fan, Staff, StaffTag, Tag
+from .models import Celebrity, ColumnAliasCollision, Fan, Staff, StaffTag, Tag
+
+
+class Volatile(Transform):
+    """Equal instances produce independent values, like random()."""
+
+    lookup_name = "volatile"
+    output_field = FloatField()
+    template = "(RANDOM() + 0 * LENGTH(%(expressions)s))"
 
 
 @skipUnlessDBFeature("can_distinct_on_fields")
@@ -178,6 +187,178 @@ class DistinctOnTests(TestCase):
             .order_by("nAmEAlIaS")
         )
         self.assertSequenceEqual(qs, [self.p1_o1, self.p2_o1, self.p3_o1])
+
+    def test_distinct_on_field_shadowed_by_extra_select(self):
+        # An extra() selection reusing a field name must not capture the
+        # field's DISTINCT ON reference.
+        qs = Staff.objects.extra(select={"name": "1"}).distinct("name")
+        self.assertEqual(qs.count(), 3)
+
+    def test_distinct_on_field_named_like_synthetic_alias(self):
+        # In a subquery, unaliased selections receive synthetic column
+        # aliases (col1, col2, ...) that must not be mistaken for a field
+        # that happens to share the name. values() without arguments selects
+        # every field unaliased while recording their names, so "col1" here
+        # would otherwise bind DISTINCT ON to the first output column (the
+        # pk) and count distinct ids instead.
+        ColumnAliasCollision.objects.create(col1=1)
+        ColumnAliasCollision.objects.create(col1=1)
+        ColumnAliasCollision.objects.create(col1=2)
+        qs = ColumnAliasCollision.objects.values().distinct("col1")
+        self.assertEqual(qs.count(), 2)
+
+    def test_distinct_on_selected_fields_by_position(self):
+        # Selected distinct fields are referred to by select position, so the
+        # DISTINCT ON expressions match the initial ORDER BY expressions by
+        # construction.
+        fields = ["stafftag__tag__name", "tags__name", "name"]
+        qs = Staff.objects.order_by(*fields).distinct(*fields).values_list(*fields)
+        sql = str(qs.query)
+        self.assertIn("DISTINCT ON (1, 2, 3)", sql)
+        self.assertIn("ORDER BY 1 ASC, 2 ASC, 3 ASC", sql)
+
+    def test_distinct_on_duplicated_selected_columns(self):
+        # "stafftag__tag__name" and "tags__name" resolve to the same column, so
+        # it's selected twice, but DISTINCT ON refers to its first selection.
+        fields = ["stafftag__tag__name", "tags__name", "name"]
+        qs = (
+            Staff.objects.order_by(*[F(field).asc(nulls_last=True) for field in fields])
+            .distinct(*fields)
+            .values_list(*fields)
+        )
+        self.assertSequenceEqual(
+            qs,
+            [
+                ("t1", "t1", "p1"),
+                (None, None, "p1"),
+                (None, None, "p2"),
+                (None, None, "p3"),
+            ],
+        )
+
+    def test_distinct_on_duplicated_selected_columns_descending(self):
+        fields = ["stafftag__tag__name", "tags__name", "name"]
+        qs = (
+            Staff.objects.order_by(
+                *[F(field).desc(nulls_first=True) for field in fields]
+            )
+            .distinct(*fields)
+            .values_list(*fields)
+        )
+        self.assertSequenceEqual(
+            qs,
+            [
+                (None, None, "p3"),
+                (None, None, "p2"),
+                (None, None, "p1"),
+                ("t1", "t1", "p1"),
+            ],
+        )
+
+    def test_distinct_on_duplicated_selected_foreign_key_columns(self):
+        # The local "tag_id" and remote "tag__id" references of a foreign key
+        # resolve to the same column without requiring different join aliases.
+        fields = ["tag_id", "tag__id", "tag__name"]
+        qs = StaffTag.objects.order_by(*fields).distinct(*fields).values_list(*fields)
+        self.assertSequenceEqual(qs, [(self.t1.pk, self.t1.pk, "t1")])
+
+    def test_distinct_on_duplicated_selected_transforms(self):
+        # Transforms of the same column are equal expressions as well, and are
+        # also referred to by expression by DISTINCT ON.
+        fields = ["stafftag__tag__name__lower", "tags__name__lower", "name"]
+        with register_lookup(CharField, Lower):
+            qs = (
+                Staff.objects.order_by(
+                    *[F(field).asc(nulls_last=True) for field in fields]
+                )
+                .distinct(*fields)
+                .values_list(*fields)
+            )
+            self.assertSequenceEqual(
+                qs,
+                [
+                    ("t1", "t1", "p1"),
+                    (None, None, "p1"),
+                    (None, None, "p2"),
+                    (None, None, "p3"),
+                ],
+            )
+
+    def test_distinct_on_column_selected_by_annotation_first(self):
+        # The annotation selects the column before the lookup path does, and
+        # DISTINCT ON binds to the first selection of the column regardless of
+        # it being selected by an annotation.
+        qs = (
+            Staff.objects.annotate(name_alias=F("name"))
+            .order_by("name")
+            .distinct("name")
+            .values_list("name_alias", "name")
+        )
+        self.assertSequenceEqual(qs, [("p1", "p1"), ("p2", "p2"), ("p3", "p3")])
+
+    def test_distinct_on_annotation_duplicating_selected_column(self):
+        # The annotation duplicates a column selected at an earlier position.
+        # get_distinct() refers to annotations by alias, which binds to the
+        # annotation's own position, so ordering by the alias must not refer
+        # to the earlier position.
+        qs = (
+            Staff.objects.annotate(name_alias=F("name"))
+            .order_by("name_alias")
+            .distinct("name_alias")
+            .values_list("name", "name_alias")
+        )
+        self.assertSequenceEqual(qs, [("p1", "p1"), ("p2", "p2"), ("p3", "p3")])
+
+    def test_distinct_on_duplicated_selected_columns_with_annotation(self):
+        # The annotation is selected between the two selections of the column
+        # it aliases. DISTINCT ON refers to annotations by alias, so it must
+        # not shadow the first selection of the column itself.
+        fields = ["stafftag__tag__name", "tags__name", "name"]
+        qs = (
+            Staff.objects.annotate(tag_name=F("tags__name"))
+            .order_by(*[F(field).asc(nulls_last=True) for field in fields])
+            .distinct(*fields)
+            .values_list("stafftag__tag__name", "tag_name", "tags__name", "name")
+        )
+        self.assertSequenceEqual(
+            qs,
+            [
+                ("t1", "t1", "t1", "p1"),
+                (None, None, None, "p1"),
+                (None, None, None, "p2"),
+                (None, None, None, "p3"),
+            ],
+        )
+
+    def test_distinct_on_duplicated_volatile_transform(self):
+        # A volatile transform selected through two lookup paths yields equal
+        # expressions that evaluate independently. Selections that are not
+        # DISTINCT ON expressions keep ordering by their own position.
+        fields = ["stafftag__tag__name__volatile", "tags__name__volatile", "name"]
+        with register_lookup(CharField, Volatile):
+            qs = (
+                Staff.objects.values_list(*fields)
+                .distinct("name")
+                .order_by("name", "tags__name__volatile")
+            )
+            # The second volatile selection is ordered by its own position,
+            # not remapped to the position of the first.
+            self.assertIn("ORDER BY 3 ASC, 2 ASC", str(qs.query))
+            self.assertEqual(len(qs), 3)
+
+    def test_distinct_on_duplicated_raw_sql_annotations(self):
+        # Identical raw SQL selections compare equal but are evaluated
+        # independently, so each keeps ordering by its own position.
+        qs = (
+            Staff.objects.annotate(
+                a=RawSQL("random()", [], output_field=FloatField()),
+                b=RawSQL("random()", [], output_field=FloatField()),
+            )
+            .values("a", "b", "id")
+            .distinct("name")
+            .order_by("name", "b")
+        )
+        self.assertEqual(len(qs), 3)
 
     def test_disallowed_update_distinct_on(self):
         qs = Staff.objects.distinct("organisation").order_by("organisation")

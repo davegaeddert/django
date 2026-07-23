@@ -61,6 +61,7 @@ class SQLCompiler:
         # columns needed for grammatical correctness of the query, but these
         # columns are not included in self.select.
         self.select = None
+        self.select_ordinals = None
         self.annotation_col_map = None
         self.klass_info = None
         self._meta_ordering = None
@@ -314,6 +315,12 @@ class SQLCompiler:
 
         ret = []
         col_idx = 1
+        # Physical output positions of the deliberately aliased selections,
+        # recorded before any synthetic subquery alias (col1, col2, ...) is
+        # assigned so those cannot shadow a field name. A composite ColPairs
+        # selection spans several output columns.
+        select_ordinals = {}
+        ordinal = 1
         for col, alias in select:
             try:
                 sql, params = self.compile(col)
@@ -330,10 +337,14 @@ class SQLCompiler:
                 sql, params = self.compile(Value(True))
             else:
                 sql, params = col.select_format(self, sql, params)
+            if alias is not None:
+                select_ordinals.setdefault(alias, ordinal)
+            ordinal += len(col) if isinstance(col, ColPairs) else 1
             if alias is None and with_col_aliases:
                 alias = f"col{col_idx}"
                 col_idx += 1
             ret.append((col, (sql, params), alias))
+        self.select_ordinals = select_ordinals
         return ret, klass_info, annotations
 
     def _order_by_pairs(self):
@@ -1043,19 +1054,32 @@ class SQLCompiler:
         params = []
         opts = self.query.get_meta()
 
+        # Selected distinct fields are referred to by their select position,
+        # as PostgreSQL interprets DISTINCT ON expressions using the same
+        # rules as ORDER BY, where an integer binds to an output column. This
+        # way a duplicated selection cannot make DISTINCT ON and ORDER BY
+        # refer to different positions of equal expressions. Positions come
+        # from get_select() and count physical output columns; ordering
+        # counts select entries instead, so the two disagree past a composite
+        # selection until ordering counts physical columns as well. Extra
+        # selections are excluded — an extra() alias reusing a field name
+        # must not capture the field's DISTINCT ON reference.
+        selectable = ()
+        if self.query.distinct_fields:
+            selectable = {*self.query.values_select, *self.query.annotation_select}
         for name in self.query.distinct_fields:
+            if name in selectable and (position := self.select_ordinals.get(name)):
+                result.append(str(position))
+                continue
             parts = name.split(LOOKUP_SEP)
             _, targets, alias, joins, path, _, transform_function = self._setup_joins(
                 parts, opts, None
             )
             targets, alias, _ = self.query.trim_joins(targets, joins, path)
             for target in targets:
-                if name in self.query.annotation_select:
-                    result.append(self.connection.ops.quote_name(name))
-                else:
-                    r, p = self.compile(transform_function(target, alias))
-                    result.append(r)
-                    params.append(p)
+                r, p = self.compile(transform_function(target, alias))
+                result.append(r)
+                params.append(p)
         return result, params
 
     def find_ordering_name(
