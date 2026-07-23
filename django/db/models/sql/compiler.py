@@ -1043,19 +1043,36 @@ class SQLCompiler:
         params = []
         opts = self.query.get_meta()
 
+        # Selected fields are referred to by their select position, the same
+        # scheme ordering uses, so that DISTINCT ON expressions and the
+        # initial ORDER BY expressions match by construction. Positions are
+        # physical output columns, as a composite selection spans several.
+        select_ordinals = {}
+        select_widths = {}
+        ordinal = 1
+        for expr, _, alias in self.select:
+            width = len(expr) if isinstance(expr, ColPairs) else 1
+            if alias is not None and alias not in select_ordinals:
+                select_ordinals[alias] = ordinal
+                select_widths[alias] = width
+            ordinal += width
+
         for name in self.query.distinct_fields:
+            if ordinal := select_ordinals.get(name):
+                result.extend(
+                    str(position)
+                    for position in range(ordinal, ordinal + select_widths[name])
+                )
+                continue
             parts = name.split(LOOKUP_SEP)
             _, targets, alias, joins, path, _, transform_function = self._setup_joins(
                 parts, opts, None
             )
             targets, alias, _ = self.query.trim_joins(targets, joins, path)
             for target in targets:
-                if name in self.query.annotation_select:
-                    result.append(self.connection.ops.quote_name(name))
-                else:
-                    r, p = self.compile(transform_function(target, alias))
-                    result.append(r)
-                    params.append(p)
+                r, p = self.compile(transform_function(target, alias))
+                result.append(r)
+                params.append(p)
         return result, params
 
     def find_ordering_name(
