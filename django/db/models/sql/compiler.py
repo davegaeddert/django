@@ -3,7 +3,7 @@ import json
 import re
 import warnings
 from functools import partial
-from itertools import chain
+from itertools import chain, count, islice
 
 from django.core.exceptions import EmptyResultSet, FieldError, FullResultSet
 from django.db import DatabaseError, NotSupportedError
@@ -62,6 +62,7 @@ class SQLCompiler:
         # columns are not included in self.select.
         self.select = None
         self.select_ordinals = None
+        self.select_positions = None
         self.annotation_col_map = None
         self.klass_info = None
         self._meta_ordering = None
@@ -80,6 +81,10 @@ class SQLCompiler:
             with_col_aliases=with_col_aliases,
         )
         self.col_count = len(self.select)
+        # Rows are composed of physical columns, of which a select entry can
+        # span several (a composite ColPairs selection), so rows must not be
+        # sliced by the entry count.
+        self.row_col_count = sum(width for _, width in self.select_positions)
 
     def pre_sql_setup(self, with_col_aliases=False):
         """
@@ -158,9 +163,14 @@ class SQLCompiler:
         # set to group by. So, we need to add cols in select, order_by, and
         # having into the select in any case.
         selected_expr_positions = {}
-        for ordinal, (expr, _, alias) in enumerate(select, start=1):
+        for idx, (expr, _, alias) in enumerate(select):
             if alias:
-                selected_expr_positions[expr] = ordinal
+                # Positions are the physical output columns recorded by
+                # get_select(), kept with their widths so a composite
+                # selection contributes every position it occupies. Entries
+                # past its select clause are the ordering-forced extra
+                # selections, which are never aliased.
+                selected_expr_positions[expr] = self.select_positions[idx]
             # Skip members of the select clause that are already explicitly
             # grouped against.
             if alias in group_by_refs:
@@ -191,7 +201,9 @@ class SQLCompiler:
                 allows_group_by_select_index
                 and (position := selected_expr_positions.get(expr)) is not None
             ):
-                sql, params = str(position), ()
+                first, width = position
+                sql = ", ".join(str(first + i) for i in range(width))
+                params = ()
             else:
                 sql, params = expr.select_format(self, sql, params)
             params_hash = make_hashable(params)
@@ -314,12 +326,27 @@ class SQLCompiler:
             self.get_select_from_parent(klass_info)
 
         ret = []
-        col_idx = 1
-        # Physical output positions of the deliberately aliased selections,
-        # recorded before any synthetic subquery alias (col1, col2, ...) is
-        # assigned so those cannot shadow a field name. A composite ColPairs
-        # selection spans several output columns.
+        if with_col_aliases:
+            # Synthetic aliases must not collide with deliberate selection
+            # aliases — an annotation may itself be named col2.
+            taken_aliases = {a for _, a in select if a is not None}
+            synthetic_aliases = (
+                candidate
+                for index in count(1)
+                if (candidate := f"col{index}") not in taken_aliases
+            )
+        # The physical output positions of the select clause, recorded once
+        # here where the clause is built and consumed by every position
+        # reference downstream (ordering, grouping, DISTINCT ON). A composite
+        # ColPairs selection compiles to as many output columns as it has
+        # targets, so positions and select entries diverge past one.
+        # select_ordinals maps each deliberately aliased selection to its
+        # (ordinal, width), recorded before any synthetic subquery alias
+        # (col1, col2, ...) is assigned so those cannot shadow a field name.
+        # select_positions carries (ordinal, width) per select entry, in
+        # order.
         select_ordinals = {}
+        select_positions = []
         ordinal = 1
         for col, alias in select:
             try:
@@ -337,14 +364,31 @@ class SQLCompiler:
                 sql, params = self.compile(Value(True))
             else:
                 sql, params = col.select_format(self, sql, params)
+            width = len(col) if isinstance(col, ColPairs) else 1
             if alias is not None:
-                select_ordinals.setdefault(alias, ordinal)
-            ordinal += len(col) if isinstance(col, ColPairs) else 1
+                select_ordinals.setdefault(alias, (ordinal, width))
+            select_positions.append((ordinal, width))
+            ordinal += width
             if alias is None and with_col_aliases:
-                alias = f"col{col_idx}"
-                col_idx += 1
+                if isinstance(col, ColPairs):
+                    # Each physical column carries its own alias, as one
+                    # alias cannot address the whole span. The aliases are
+                    # embedded in the SQL here; the tuple alias tells
+                    # as_sql() not to append another.
+                    alias = tuple(islice(synthetic_aliases, width))
+                    sql = ", ".join(
+                        "%s AS %s"
+                        % (
+                            self.compile(target_col)[0],
+                            self.connection.ops.quote_name(target_alias),
+                        )
+                        for target_col, target_alias in zip(col.get_cols(), alias)
+                    )
+                else:
+                    alias = next(synthetic_aliases)
             ret.append((col, (sql, params), alias))
         self.select_ordinals = select_ordinals
+        self.select_positions = select_positions
         return ret, klass_info, annotations
 
     def _order_by_pairs(self):
@@ -368,7 +412,11 @@ class SQLCompiler:
         # Avoid computing `selected_exprs` if there is no `ordering` as it's
         # relatively expensive.
         if ordering and (select := self.select):
-            for ordinal, (expr, _, alias) in enumerate(select, start=1):
+            # Positions are the physical output columns recorded by
+            # get_select(), so they stay aligned with DISTINCT ON references
+            # and with what the database counts, also past a composite
+            # selection that spans several columns.
+            for (expr, _, alias), (ordinal, _) in zip(select, self.select_positions):
                 pos_expr = PositionRef(ordinal, alias, expr)
                 if alias:
                     selected_exprs[alias] = pos_expr
@@ -501,6 +549,7 @@ class SQLCompiler:
         seen = set()
         for expr, is_ref in self._order_by_pairs():
             resolved = expr.resolve_expression(self.query, allow_joins=True, reuse=None)
+            resolved_items = [resolved]
             if not is_ref and self.query.combinator and self.select:
                 src = resolved.expression
                 expr_src = expr.expression
@@ -516,9 +565,27 @@ class SQLCompiler:
                             )
                         ):
                             continue
-                        resolved.set_source_expressions(
-                            [Ref(col_alias if col_alias else src.target.column, src)]
-                        )
+                        if isinstance(col_alias, tuple):
+                            # A composite selection spans several aliased
+                            # columns, so it is ordered by each of them.
+                            resolved_items = []
+                            for target_col, target_alias in zip(
+                                sel_expr.get_cols(), col_alias
+                            ):
+                                item = resolved.copy()
+                                item.set_source_expressions(
+                                    [Ref(target_alias, target_col)]
+                                )
+                                resolved_items.append(item)
+                        else:
+                            resolved.set_source_expressions(
+                                [
+                                    Ref(
+                                        col_alias if col_alias else src.target.column,
+                                        src,
+                                    )
+                                ]
+                            )
                         break
                 else:
                     # Add column used in ORDER BY clause to the selected
@@ -536,17 +603,18 @@ class SQLCompiler:
                         q.add_annotation(expr_src, col_alias)
                     self.query.add_select_col(resolved, col_alias)
                     resolved.set_source_expressions([Ref(col_alias, src)])
-            sql, params = self.compile(resolved)
-            # Don't add the same column twice, but the order direction is
-            # not taken into account so we strip it. When this entire method
-            # is refactored into expressions, then we can check each part as we
-            # generate it.
-            without_ordering = self.ordering_parts.search(sql)[1]
-            params_hash = make_hashable(params)
-            if (without_ordering, params_hash) in seen:
-                continue
-            seen.add((without_ordering, params_hash))
-            result.append((resolved, (sql, params, is_ref)))
+            for resolved_item in resolved_items:
+                sql, params = self.compile(resolved_item)
+                # Don't add the same column twice, but the order direction is
+                # not taken into account so we strip it. When this entire
+                # method is refactored into expressions, then we can check
+                # each part as we generate it.
+                without_ordering = self.ordering_parts.search(sql)[1]
+                params_hash = make_hashable(params)
+                if (without_ordering, params_hash) in seen:
+                    continue
+                seen.add((without_ordering, params_hash))
+                result.append((resolved_item, (sql, params, is_ref)))
         return result
 
     def get_extra_select(self, order_by, select):
@@ -682,10 +750,28 @@ class SQLCompiler:
         # might have been masked via values() and alias(). If any masked
         # aliases are added they'll be masked again to avoid fetching
         # the data in the `if qual_aliases` branch below.
-        select = {
-            expr: alias for expr, _, alias in self.get_select(with_col_aliases=True)[0]
-        }
-        select_aliases = set(select.values())
+        # An expression can be selected at more than one position, e.g. when
+        # two lookup paths resolve to the same column, so the aliases of every
+        # selection must be tracked and not only one per expression, otherwise
+        # the masking of the outer query below drops the extra selections.
+        selected = self.get_select(with_col_aliases=True)[0]
+        select = {}
+        selected_aliases = []
+        composite_selects = {}
+        for expr, _, alias in selected:
+            if isinstance(alias, tuple):
+                # A composite selection spans several physical columns, each
+                # with its own alias. Register the columns so references to
+                # them resolve to the aliases instead of re-selecting the
+                # columns.
+                selected_aliases.extend(alias)
+                composite_selects[expr] = alias
+                for target_col, target_alias in zip(expr.get_cols(), alias):
+                    select.setdefault(target_col, target_alias)
+            else:
+                select.setdefault(expr, alias)
+                selected_aliases.append(alias)
+        select_aliases = set(selected_aliases)
         qual_aliases = set()
         replacements = {}
 
@@ -714,7 +800,20 @@ class SQLCompiler:
         )
         order_by = []
         for order_by_expr, *_ in self.get_order_by():
-            collect_replacements(order_by_expr.get_source_expressions())
+            source_exprs = order_by_expr.get_source_expressions()
+            if len(source_exprs) == 1 and (
+                composite_aliases := composite_selects.get(source_exprs[0])
+            ):
+                # Ordering by a composite selection expands to one item per
+                # aliased column.
+                for target_col, target_alias in zip(
+                    source_exprs[0].get_cols(), composite_aliases
+                ):
+                    item = order_by_expr.copy()
+                    item.set_source_expressions([Ref(target_alias, target_col)])
+                    order_by.append(item)
+                continue
+            collect_replacements(source_exprs)
             order_by.append(
                 order_by_expr.replace_expressions(
                     {expr: Ref(alias, expr) for expr, alias in replacements.items()}
@@ -743,7 +842,7 @@ class SQLCompiler:
         if qual_aliases:
             # If some select aliases were unmasked for filtering purposes they
             # must be masked back.
-            cols = [self.connection.ops.quote_name(alias) for alias in select.values()]
+            cols = [self.connection.ops.quote_name(alias) for alias in selected_aliases]
             result = [
                 "SELECT",
                 ", ".join(cols),
@@ -834,7 +933,9 @@ class SQLCompiler:
 
                 out_cols = []
                 for _, (s_sql, s_params), alias in self.select + extra_select:
-                    if alias:
+                    # A tuple alias spans several physical columns and is
+                    # already embedded in the SQL by get_select().
+                    if alias and not isinstance(alias, tuple):
                         s_sql = "%s AS %s" % (
                             s_sql,
                             self.connection.ops.quote_name(alias),
@@ -965,7 +1066,18 @@ class SQLCompiler:
                 sub_selects = []
                 sub_params = []
                 for index, (select, _, alias) in enumerate(self.select, start=1):
-                    if alias:
+                    if isinstance(alias, tuple):
+                        # A composite selection carries one alias per physical
+                        # column.
+                        sub_selects.extend(
+                            "%s.%s"
+                            % (
+                                self.connection.ops.quote_name("subquery"),
+                                self.connection.ops.quote_name(target_alias),
+                            )
+                            for target_alias in alias
+                        )
+                    elif alias:
                         sub_selects.append(
                             "%s.%s"
                             % (
@@ -1063,13 +1175,19 @@ class SQLCompiler:
         # counts select entries instead, so the two disagree past a composite
         # selection until ordering counts physical columns as well. Extra
         # selections are excluded — an extra() alias reusing a field name
-        # must not capture the field's DISTINCT ON reference.
+        # must not capture the field's DISTINCT ON reference, whether the
+        # name is only the extra alias or also a selected field whose
+        # ordinal the extra selection shadowed.
         selectable = ()
         if self.query.distinct_fields:
-            selectable = {*self.query.values_select, *self.query.annotation_select}
+            selectable = {
+                *self.query.values_select,
+                *self.query.annotation_select,
+            } - {*self.query.extra_select}
         for name in self.query.distinct_fields:
             if name in selectable and (position := self.select_ordinals.get(name)):
-                result.append(str(position))
+                first, width = position
+                result.extend(str(first + i) for i in range(width))
                 continue
             parts = name.split(LOOKUP_SEP)
             _, targets, alias, joins, path, _, transform_function = self._setup_joins(
@@ -1667,7 +1785,7 @@ class SQLCompiler:
             try:
                 val = cursor.fetchone()
                 if val:
-                    return val[0 : self.col_count]
+                    return val[0 : self.row_col_count]
                 return val
             finally:
                 # done with the cursor
@@ -1679,7 +1797,7 @@ class SQLCompiler:
         result = cursor_iter(
             cursor,
             self.connection.features.empty_fetchmany_value,
-            self.col_count if self.has_extra_select else None,
+            self.row_col_count if self.has_extra_select else None,
             chunk_size,
         )
         if not chunked_fetch or not self.connection.features.can_use_chunked_reads:
@@ -2267,6 +2385,8 @@ class SQLAggregateCompiler(SQLCompiler):
             sql.append(ann_sql)
             params.extend(ann_params)
         self.col_count = len(self.query.annotation_select)
+        # Aggregations are always compiled to a single column each.
+        self.row_col_count = self.col_count
         sql = ", ".join(sql)
         params = tuple(params)
 

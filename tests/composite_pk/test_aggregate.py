@@ -1,5 +1,5 @@
 from django.db.models import Count, Max, Q
-from django.test import TestCase
+from django.test import TestCase, skipUnlessDBFeature
 
 from .models import Comment, Tenant, User
 
@@ -161,3 +161,44 @@ class CompositePKAggregateTests(TestCase):
         )
         with self.assertRaisesMessage(TypeError, msg):
             Comment.objects.values("tenant").annotate(max=Max("id")).first()
+
+    def test_count_grouped_values_pk(self):
+        # Counting over grouped values() wraps the grouped query in a
+        # subquery with column aliases; positional grouping must cover every
+        # physical column of the composite selection.
+        self.assertEqual(
+            User.objects.values("pk", "email").annotate(n=Count("comments")).count(),
+            3,
+        )
+        self.assertEqual(
+            User.objects.values("email", "pk").annotate(n=Count("comments")).count(),
+            3,
+        )
+
+    def test_aggregate_sliced_values_pk_with_colliding_annotation_alias(self):
+        # Synthetic subquery aliases (col1, col2, ...) for the composite
+        # selection must not collide with an annotation deliberately named
+        # like one of them.
+        self.assertEqual(
+            User.objects.annotate(col2=Max("comments__id"))
+            .values("pk", "col2")
+            .order_by("pk")[:2]
+            .aggregate(max_col2=Max("col2")),
+            {"max_col2": 3},
+        )
+
+    def test_count_sliced_distinct_values_pk(self):
+        # Slicing a distinct queryset ordered by an unselected column wraps
+        # it in a subquery that reselects each selection by alias; a
+        # composite selection carries one alias per column.
+        self.assertEqual(
+            User.objects.values("pk").distinct().order_by("email")[:2].count(), 2
+        )
+
+    @skipUnlessDBFeature("allows_group_by_select_index")
+    def test_group_by_position_of_column_after_composite_pk(self):
+        # A composite primary key is selected as one column per target, so
+        # grouping by position must account for its width.
+        qs = User.objects.values("pk", "email").annotate(count=Count("comments"))
+        sql = qs.query.get_compiler(qs.db).as_sql()[0]
+        self.assertIn("GROUP BY 3", sql)

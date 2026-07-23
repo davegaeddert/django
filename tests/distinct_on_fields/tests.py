@@ -194,6 +194,13 @@ class DistinctOnTests(TestCase):
         qs = Staff.objects.extra(select={"name": "1"}).distinct("name")
         self.assertEqual(qs.count(), 3)
 
+    def test_distinct_on_field_shadowed_by_extra_select_in_values(self):
+        # Even when the field itself is selected via values(), the shadowing
+        # extra() selection must not donate its select position to the
+        # field's DISTINCT ON reference.
+        qs = Staff.objects.extra(select={"name": "1"}).values().distinct("name")
+        self.assertEqual(qs.count(), 3)
+
     def test_distinct_on_field_named_like_synthetic_alias(self):
         # In a subquery, unaliased selections receive synthetic column
         # aliases (col1, col2, ...) that must not be mistaken for a field
