@@ -538,6 +538,7 @@ class SQLCompiler:
         seen = set()
         for expr, is_ref in self._order_by_pairs():
             resolved = expr.resolve_expression(self.query, allow_joins=True, reuse=None)
+            resolved_items = [resolved]
             if not is_ref and self.query.combinator and self.select:
                 src = resolved.expression
                 expr_src = expr.expression
@@ -553,9 +554,27 @@ class SQLCompiler:
                             )
                         ):
                             continue
-                        resolved.set_source_expressions(
-                            [Ref(col_alias if col_alias else src.target.column, src)]
-                        )
+                        if isinstance(col_alias, tuple):
+                            # A composite selection spans several aliased
+                            # columns, so it is ordered by each of them.
+                            resolved_items = []
+                            for target_col, target_alias in zip(
+                                sel_expr.get_cols(), col_alias
+                            ):
+                                item = resolved.copy()
+                                item.set_source_expressions(
+                                    [Ref(target_alias, target_col)]
+                                )
+                                resolved_items.append(item)
+                        else:
+                            resolved.set_source_expressions(
+                                [
+                                    Ref(
+                                        col_alias if col_alias else src.target.column,
+                                        src,
+                                    )
+                                ]
+                            )
                         break
                 else:
                     # Add column used in ORDER BY clause to the selected
@@ -573,17 +592,18 @@ class SQLCompiler:
                         q.add_annotation(expr_src, col_alias)
                     self.query.add_select_col(resolved, col_alias)
                     resolved.set_source_expressions([Ref(col_alias, src)])
-            sql, params = self.compile(resolved)
-            # Don't add the same column twice, but the order direction is
-            # not taken into account so we strip it. When this entire method
-            # is refactored into expressions, then we can check each part as we
-            # generate it.
-            without_ordering = self.ordering_parts.search(sql)[1]
-            params_hash = make_hashable(params)
-            if (without_ordering, params_hash) in seen:
-                continue
-            seen.add((without_ordering, params_hash))
-            result.append((resolved, (sql, params, is_ref)))
+            for resolved_item in resolved_items:
+                sql, params = self.compile(resolved_item)
+                # Don't add the same column twice, but the order direction is
+                # not taken into account so we strip it. When this entire
+                # method is refactored into expressions, then we can check
+                # each part as we generate it.
+                without_ordering = self.ordering_parts.search(sql)[1]
+                params_hash = make_hashable(params)
+                if (without_ordering, params_hash) in seen:
+                    continue
+                seen.add((without_ordering, params_hash))
+                result.append((resolved_item, (sql, params, is_ref)))
         return result
 
     def get_extra_select(self, order_by, select):
@@ -726,11 +746,17 @@ class SQLCompiler:
         selected = self.get_select(with_col_aliases=True)[0]
         select = {}
         selected_aliases = []
+        composite_selects = {}
         for expr, _, alias in selected:
             if isinstance(alias, tuple):
                 # A composite selection spans several physical columns, each
-                # with its own alias.
+                # with its own alias. Register the columns so references to
+                # them resolve to the aliases instead of re-selecting the
+                # columns.
                 selected_aliases.extend(alias)
+                composite_selects[expr] = alias
+                for target_col, target_alias in zip(expr.get_cols(), alias):
+                    select.setdefault(target_col, target_alias)
             else:
                 select.setdefault(expr, alias)
                 selected_aliases.append(alias)
@@ -763,7 +789,20 @@ class SQLCompiler:
         )
         order_by = []
         for order_by_expr, *_ in self.get_order_by():
-            collect_replacements(order_by_expr.get_source_expressions())
+            source_exprs = order_by_expr.get_source_expressions()
+            if len(source_exprs) == 1 and (
+                composite_aliases := composite_selects.get(source_exprs[0])
+            ):
+                # Ordering by a composite selection expands to one item per
+                # aliased column.
+                for target_col, target_alias in zip(
+                    source_exprs[0].get_cols(), composite_aliases
+                ):
+                    item = order_by_expr.copy()
+                    item.set_source_expressions([Ref(target_alias, target_col)])
+                    order_by.append(item)
+                continue
+            collect_replacements(source_exprs)
             order_by.append(
                 order_by_expr.replace_expressions(
                     {expr: Ref(alias, expr) for expr, alias in replacements.items()}

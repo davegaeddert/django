@@ -101,3 +101,33 @@ class CompositePKOrderByTests(TestCase):
                 (self.user_3.pk, "user0003@example.com"),
             ),
         )
+
+    def test_union_order_by_composite_pk(self):
+        # A composite selection spans several aliased columns in the combined
+        # queries, and ordering by it must order by each of them.
+        qs = User.objects.values_list("pk", "email")
+        self.assertSequenceEqual(
+            qs.union(qs).order_by("pk"),
+            (
+                (self.user_1.pk, self.user_1.email),
+                (self.user_2.pk, self.user_2.email),
+                (self.user_3.pk, self.user_3.email),
+            ),
+        )
+
+    def test_union_order_by_field_selected_after_composite_pk(self):
+        # Ordering by position must count the physical columns the composite
+        # primary key spans in the combined queries.
+        user_4 = User.objects.create(
+            tenant=self.tenant_2, id=4, email="user0000@example.com"
+        )
+        qs = User.objects.values_list("pk", "email")
+        self.assertSequenceEqual(
+            qs.union(qs).order_by("email"),
+            (
+                (user_4.pk, user_4.email),
+                (self.user_1.pk, self.user_1.email),
+                (self.user_2.pk, self.user_2.email),
+                (self.user_3.pk, self.user_3.email),
+            ),
+        )

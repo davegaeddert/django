@@ -266,3 +266,20 @@ class CompositePKValuesTests(TestCase):
             .values_list("pk", "secret")
         )
         self.assertCountEqual(qs, [(token_1.pk, ""), (token_3.pk, "")])
+
+    @skipUnlessDBFeature("supports_over_clause")
+    def test_values_pk_with_filtered_window_ordered_by_pk(self):
+        # Ordering the filtered window query by the composite pk expands to
+        # the aliased columns of the inner query.
+        token_1 = Token.objects.create(tenant=self.tenant_1, id=1)
+        Token.objects.create(tenant=self.tenant_1, id=2)
+        token_3 = Token.objects.create(tenant=self.tenant_2, id=3)
+        qs = (
+            Token.objects.annotate(
+                rn=Window(RowNumber(), partition_by=F("tenant_id"), order_by="id")
+            )
+            .filter(rn=1)
+            .order_by("pk")
+            .values_list("pk", "secret")
+        )
+        self.assertSequenceEqual(qs, [(token_1.pk, ""), (token_3.pk, "")])
