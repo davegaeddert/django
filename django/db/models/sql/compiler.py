@@ -1175,10 +1175,15 @@ class SQLCompiler:
         # counts select entries instead, so the two disagree past a composite
         # selection until ordering counts physical columns as well. Extra
         # selections are excluded — an extra() alias reusing a field name
-        # must not capture the field's DISTINCT ON reference.
+        # must not capture the field's DISTINCT ON reference, whether the
+        # name is only the extra alias or also a selected field whose
+        # ordinal the extra selection shadowed.
         selectable = ()
         if self.query.distinct_fields:
-            selectable = {*self.query.values_select, *self.query.annotation_select}
+            selectable = {
+                *self.query.values_select,
+                *self.query.annotation_select,
+            } - {*self.query.extra_select}
         for name in self.query.distinct_fields:
             if name in selectable and (position := self.select_ordinals.get(name)):
                 first, width = position
