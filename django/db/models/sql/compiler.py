@@ -61,6 +61,7 @@ class SQLCompiler:
         # columns needed for grammatical correctness of the query, but these
         # columns are not included in self.select.
         self.select = None
+        self.select_ordinals = None
         self.annotation_col_map = None
         self.klass_info = None
         self._meta_ordering = None
@@ -314,6 +315,12 @@ class SQLCompiler:
 
         ret = []
         col_idx = 1
+        # Physical output positions of the deliberately aliased selections,
+        # recorded before any synthetic subquery alias (col1, col2, ...) is
+        # assigned so those cannot shadow a field name. A composite ColPairs
+        # selection spans several output columns.
+        select_ordinals = {}
+        ordinal = 1
         for col, alias in select:
             try:
                 sql, params = self.compile(col)
@@ -330,10 +337,14 @@ class SQLCompiler:
                 sql, params = self.compile(Value(True))
             else:
                 sql, params = col.select_format(self, sql, params)
+            if alias is not None:
+                select_ordinals.setdefault(alias, ordinal)
+            ordinal += len(col) if isinstance(col, ColPairs) else 1
             if alias is None and with_col_aliases:
                 alias = f"col{col_idx}"
                 col_idx += 1
             ret.append((col, (sql, params), alias))
+        self.select_ordinals = select_ordinals
         return ret, klass_info, annotations
 
     def _order_by_pairs(self):
@@ -1047,23 +1058,12 @@ class SQLCompiler:
         # as PostgreSQL interprets DISTINCT ON expressions using the same
         # rules as ORDER BY, where an integer binds to an output column. This
         # way a duplicated selection cannot make DISTINCT ON and ORDER BY
-        # refer to different positions of equal expressions. Positions count
-        # physical output columns, as a composite selection spans several;
-        # ordering counts select entries instead, so the two disagree past a
-        # composite selection until ordering counts physical columns as well.
-        # Only deliberate aliases are matched — the synthetic subquery
-        # aliases (col1, col2, ...) must not shadow field names.
-        select_ordinals = {}
-        if self.query.distinct_fields:
-            aliases = {*self.query.values_select, *self.query.annotation_select}
-            ordinal = 1
-            for expr, _, alias in self.select:
-                if alias in aliases and alias not in select_ordinals:
-                    select_ordinals[alias] = ordinal
-                ordinal += len(expr) if isinstance(expr, ColPairs) else 1
-
+        # refer to different positions of equal expressions. Positions come
+        # from get_select() and count physical output columns; ordering
+        # counts select entries instead, so the two disagree past a composite
+        # selection until ordering counts physical columns as well.
         for name in self.query.distinct_fields:
-            if position := select_ordinals.get(name):
+            if position := self.select_ordinals.get(name):
                 result.append(str(position))
                 continue
             parts = name.split(LOOKUP_SEP)

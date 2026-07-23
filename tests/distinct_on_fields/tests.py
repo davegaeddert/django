@@ -5,7 +5,7 @@ from django.db.models.functions import Lower
 from django.test import TestCase, skipUnlessDBFeature
 from django.test.utils import register_lookup
 
-from .models import Celebrity, Fan, Staff, StaffTag, Tag
+from .models import Celebrity, ColumnAliasCollision, Fan, Staff, StaffTag, Tag
 
 
 class Volatile(Transform):
@@ -187,6 +187,19 @@ class DistinctOnTests(TestCase):
             .order_by("nAmEAlIaS")
         )
         self.assertSequenceEqual(qs, [self.p1_o1, self.p2_o1, self.p3_o1])
+
+    def test_distinct_on_field_named_like_synthetic_alias(self):
+        # In a subquery, unaliased selections receive synthetic column
+        # aliases (col1, col2, ...) that must not be mistaken for a field
+        # that happens to share the name. values() without arguments selects
+        # every field unaliased while recording their names, so "col1" here
+        # would otherwise bind DISTINCT ON to the first output column (the
+        # pk) and count distinct ids instead.
+        ColumnAliasCollision.objects.create(col1=1)
+        ColumnAliasCollision.objects.create(col1=1)
+        ColumnAliasCollision.objects.create(col1=2)
+        qs = ColumnAliasCollision.objects.values().distinct("col1")
+        self.assertEqual(qs.count(), 2)
 
     def test_distinct_on_selected_fields_by_position(self):
         # Selected distinct fields are referred to by select position, so the
