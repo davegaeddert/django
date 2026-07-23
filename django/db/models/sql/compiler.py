@@ -1043,26 +1043,28 @@ class SQLCompiler:
         params = []
         opts = self.query.get_meta()
 
-        # Selected fields are referred to by their select position, the same
-        # scheme ordering uses, so that DISTINCT ON expressions and the
-        # initial ORDER BY expressions match by construction. Positions are
-        # physical output columns, as a composite selection spans several.
+        # Selected distinct fields are referred to by their select position,
+        # as PostgreSQL interprets DISTINCT ON expressions using the same
+        # rules as ORDER BY, where an integer binds to an output column. This
+        # way a duplicated selection cannot make DISTINCT ON and ORDER BY
+        # refer to different positions of equal expressions. Positions count
+        # physical output columns, as a composite selection spans several;
+        # ordering counts select entries instead, so the two disagree past a
+        # composite selection until ordering counts physical columns as well.
+        # Only deliberate aliases are matched — the synthetic subquery
+        # aliases (col1, col2, ...) must not shadow field names.
         select_ordinals = {}
-        select_widths = {}
-        ordinal = 1
-        for expr, _, alias in self.select:
-            width = len(expr) if isinstance(expr, ColPairs) else 1
-            if alias is not None and alias not in select_ordinals:
-                select_ordinals[alias] = ordinal
-                select_widths[alias] = width
-            ordinal += width
+        if self.query.distinct_fields:
+            aliases = {*self.query.values_select, *self.query.annotation_select}
+            ordinal = 1
+            for expr, _, alias in self.select:
+                if alias in aliases and alias not in select_ordinals:
+                    select_ordinals[alias] = ordinal
+                ordinal += len(expr) if isinstance(expr, ColPairs) else 1
 
         for name in self.query.distinct_fields:
-            if ordinal := select_ordinals.get(name):
-                result.extend(
-                    str(position)
-                    for position in range(ordinal, ordinal + select_widths[name])
-                )
+            if position := select_ordinals.get(name):
+                result.append(str(position))
                 continue
             parts = name.split(LOOKUP_SEP)
             _, targets, alias, joins, path, _, transform_function = self._setup_joins(

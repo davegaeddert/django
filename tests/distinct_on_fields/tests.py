@@ -188,6 +188,16 @@ class DistinctOnTests(TestCase):
         )
         self.assertSequenceEqual(qs, [self.p1_o1, self.p2_o1, self.p3_o1])
 
+    def test_distinct_on_selected_fields_by_position(self):
+        # Selected distinct fields are referred to by select position, so the
+        # DISTINCT ON expressions match the initial ORDER BY expressions by
+        # construction.
+        fields = ["stafftag__tag__name", "tags__name", "name"]
+        qs = Staff.objects.order_by(*fields).distinct(*fields).values_list(*fields)
+        sql = str(qs.query)
+        self.assertIn("DISTINCT ON (1, 2, 3)", sql)
+        self.assertIn("ORDER BY 1 ASC, 2 ASC, 3 ASC", sql)
+
     def test_distinct_on_duplicated_selected_columns(self):
         # "stafftag__tag__name" and "tags__name" resolve to the same column, so
         # it's selected twice, but DISTINCT ON refers to its first selection.
@@ -314,7 +324,7 @@ class DistinctOnTests(TestCase):
             )
             # The second volatile selection is ordered by its own position,
             # not remapped to the position of the first.
-            self.assertIn("2 ASC", str(qs.query))
+            self.assertIn("ORDER BY 3 ASC, 2 ASC", str(qs.query))
             self.assertEqual(len(qs), 3)
 
     def test_distinct_on_duplicated_raw_sql_annotations(self):
